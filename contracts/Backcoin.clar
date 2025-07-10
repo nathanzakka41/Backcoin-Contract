@@ -15,6 +15,13 @@
 (define-constant ERR_PURCHASE_NOT_FOUND (err u106))
 (define-constant ERR_CASHBACK_ALREADY_CLAIMED (err u107))
 (define-constant ERR_INVALID_CASHBACK_RATE (err u108))
+(define-constant ERR_INVALID_REFERRAL_RATE (err u109))
+(define-constant ERR_SELF_REFERRAL (err u110))
+(define-constant ERR_ALREADY_REFERRED (err u111))
+(define-constant ERR_REFERRER_NOT_FOUND (err u112))
+(define-constant ERR_MINIMUM_CASHBACK_NOT_MET (err u113))
+(define-constant ERR_REFERRAL_REWARD_ALREADY_CLAIMED (err u114))
+(define-constant ERR_REFERRAL_NOT_QUALIFIED (err u115))
 
 (define-fungible-token backcoin)
 
@@ -56,7 +63,51 @@
   }
 )
 
+(define-map merchant-referrals
+  { referrer: principal, referee: principal }
+  {
+    referral-id: uint,
+    referral-block: uint,
+    referee-cashback-issued: uint,
+    total-rewards-earned: uint,
+    last-reward-claim-block: uint,
+    is-qualified: bool,
+    referrer: principal,
+    referee: principal
+  }
+)
+
+(define-map referral-rewards
+  { referral-id: uint }
+  {
+    referrer: principal,
+    referee: principal,
+    rewards-available: uint,
+    rewards-claimed: uint,
+    creation-block: uint,
+    last-update-block: uint
+  }
+)
+
+(define-map merchant-referral-stats
+  { merchant: principal }
+  {
+    total-referrals: uint,
+    qualified-referrals: uint,
+    total-rewards-earned: uint,
+    total-rewards-claimed: uint
+  }
+)
+
+(define-map referee-lookup
+  { referee: principal }
+  { referrer: principal }
+)
+
 (define-data-var next-purchase-id uint u1)
+(define-data-var referral-reward-rate uint u500)
+(define-data-var minimum-cashback-threshold uint u100000000)
+(define-data-var next-referral-id uint u1)
 
 (define-public (transfer (amount uint) (from principal) (to principal) (memo (optional (buff 34))))
   (begin
@@ -106,6 +157,53 @@
   )
 )
 
+(define-public (register-merchant-with-referral (name (string-ascii 50)) (cashback-rate uint) (referrer principal))
+  (let
+    (
+      (referrer-info (unwrap! (map-get? merchants { merchant-id: referrer }) ERR_REFERRER_NOT_FOUND))
+      (referral-id (var-get next-referral-id))
+      (merchant-data {
+        name: name,
+        cashback-rate: cashback-rate,
+        is-active: true,
+        total-cashback-issued: u0,
+        registration-block: stacks-block-height
+      })
+      (referral-data {
+        referral-id: referral-id,
+        referral-block: stacks-block-height,
+        referee-cashback-issued: u0,
+        total-rewards-earned: u0,
+        last-reward-claim-block: u0,
+        is-qualified: false,
+        referrer: referrer,
+        referee: tx-sender
+      })
+      (reward-data {
+        referrer: referrer,
+        referee: tx-sender,
+        rewards-available: u0,
+        rewards-claimed: u0,
+        creation-block: stacks-block-height,
+        last-update-block: stacks-block-height
+      })
+    )
+    (asserts! (<= cashback-rate u1000) ERR_INVALID_CASHBACK_RATE)
+    (asserts! (not (is-eq referrer tx-sender)) ERR_SELF_REFERRAL)
+    (asserts! (is-none (map-get? merchant-referrals { referrer: referrer, referee: tx-sender })) ERR_ALREADY_REFERRED)
+    (asserts! (get is-active referrer-info) ERR_MERCHANT_INACTIVE)
+    
+    (map-set merchants { merchant-id: tx-sender } merchant-data)
+    (map-set merchant-referrals { referrer: referrer, referee: tx-sender } referral-data)
+    (map-set referral-rewards { referral-id: referral-id } reward-data)
+    (map-set referee-lookup { referee: tx-sender } { referrer: referrer })
+    (var-set next-referral-id (+ referral-id u1))
+    
+    (update-referrer-stats referrer u1 u0 u0 u0)
+    (ok referral-id)
+  )
+)
+
 (define-public (update-merchant-status (merchant principal) (is-active bool))
   (let
     (
@@ -147,6 +245,7 @@
     )
     
     (update-customer-stats customer amount cashback-amount u0)
+    (unwrap-panic (update-referral-progress tx-sender cashback-amount))
     (ok purchase-id)
   )
 )
@@ -233,6 +332,95 @@
   (var-get next-purchase-id)
 )
 
+(define-public (claim-referral-rewards (referral-id uint))
+  (let
+    (
+      (reward-info (unwrap! (map-get? referral-rewards { referral-id: referral-id }) ERR_PURCHASE_NOT_FOUND))
+      (referral-key { referrer: (get referrer reward-info), referee: (get referee reward-info) })
+      (referral-info (unwrap! (map-get? merchant-referrals referral-key) ERR_PURCHASE_NOT_FOUND))
+      (rewards-to-claim (get rewards-available reward-info))
+    )
+    (asserts! (is-eq tx-sender (get referrer reward-info)) ERR_NOT_TOKEN_OWNER)
+    (asserts! (get is-qualified referral-info) ERR_REFERRAL_NOT_QUALIFIED)
+    (asserts! (> rewards-to-claim u0) ERR_REFERRAL_REWARD_ALREADY_CLAIMED)
+    
+    (try! (ft-mint? backcoin rewards-to-claim tx-sender))
+    (var-set total-supply (+ (var-get total-supply) rewards-to-claim))
+    
+    (map-set referral-rewards
+      { referral-id: referral-id }
+      (merge reward-info {
+        rewards-available: u0,
+        rewards-claimed: (+ (get rewards-claimed reward-info) rewards-to-claim),
+        last-update-block: stacks-block-height
+      })
+    )
+    
+    (map-set merchant-referrals
+      referral-key
+      (merge referral-info {
+        total-rewards-earned: (+ (get total-rewards-earned referral-info) rewards-to-claim),
+        last-reward-claim-block: stacks-block-height
+      })
+    )
+    
+    (update-referrer-stats (get referrer reward-info) u0 u0 rewards-to-claim rewards-to-claim)
+    (ok rewards-to-claim)
+  )
+)
+
+(define-public (set-referral-reward-rate (new-rate uint))
+  (begin
+    (asserts! (is-eq tx-sender CONTRACT_OWNER) ERR_OWNER_ONLY)
+    (asserts! (<= new-rate u1000) ERR_INVALID_REFERRAL_RATE)
+    (var-set referral-reward-rate new-rate)
+    (ok true)
+  )
+)
+
+(define-public (set-minimum-cashback-threshold (new-threshold uint))
+  (begin
+    (asserts! (is-eq tx-sender CONTRACT_OWNER) ERR_OWNER_ONLY)
+    (asserts! (> new-threshold u0) ERR_INVALID_AMOUNT)
+    (var-set minimum-cashback-threshold new-threshold)
+    (ok true)
+  )
+)
+
+(define-read-only (get-referral-info (referrer principal) (referee principal))
+  (map-get? merchant-referrals { referrer: referrer, referee: referee })
+)
+
+(define-read-only (get-referral-reward-info (referral-id uint))
+  (map-get? referral-rewards { referral-id: referral-id })
+)
+
+(define-read-only (get-merchant-referral-stats (merchant principal))
+  (map-get? merchant-referral-stats { merchant: merchant })
+)
+
+(define-read-only (get-referral-settings)
+  (ok {
+    reward-rate: (var-get referral-reward-rate),
+    minimum-threshold: (var-get minimum-cashback-threshold),
+    next-referral-id: (var-get next-referral-id)
+  })
+)
+
+(define-read-only (calculate-referral-rewards (referrer principal) (referee principal))
+  (match (map-get? merchant-referrals { referrer: referrer, referee: referee })
+    referral-info 
+    (let
+      (
+        (cashback-issued (get referee-cashback-issued referral-info))
+        (reward-rate (var-get referral-reward-rate))
+      )
+      (ok (/ (* cashback-issued reward-rate) u10000))
+    )
+    ERR_PURCHASE_NOT_FOUND
+  )
+)
+
 (define-private (update-customer-stats (customer principal) (purchase-amount uint) (cashback-earned uint) (cashback-spent uint))
   (let
     (
@@ -257,5 +445,90 @@
     (asserts! (is-eq tx-sender CONTRACT_OWNER) ERR_OWNER_ONLY)
     (var-set token-uri new-uri)
     (ok true)
+  )
+)
+
+(define-private (update-referral-progress (merchant principal) (cashback-amount uint))
+  (let
+    (
+      (referral-lookup (find-referral-by-referee merchant))
+    )
+    (match referral-lookup
+      referral-data
+      (let
+        (
+          (referrer (get referrer referral-data))
+          (referee (get referee referral-data))
+          (referral-id (get referral-id referral-data))
+          (current-cashback (get referee-cashback-issued referral-data))
+          (new-cashback (+ current-cashback cashback-amount))
+          (threshold (var-get minimum-cashback-threshold))
+          (reward-rate (var-get referral-reward-rate))
+          (new-rewards (/ (* cashback-amount reward-rate) u10000))
+          (should-qualify (>= new-cashback threshold))
+          (referral-key { referrer: referrer, referee: referee })
+        )
+        (map-set merchant-referrals
+          referral-key
+          (merge referral-data {
+            referee-cashback-issued: new-cashback,
+            is-qualified: should-qualify
+          })
+        )
+        
+        (match (map-get? referral-rewards { referral-id: referral-id })
+          reward-info
+          (map-set referral-rewards
+            { referral-id: referral-id }
+            (merge reward-info {
+              rewards-available: (+ (get rewards-available reward-info) new-rewards),
+              last-update-block: stacks-block-height
+            })
+          )
+          false
+        )
+        
+        (if (and should-qualify (not (get is-qualified referral-data)))
+          (update-referrer-stats referrer u0 u1 u0 u0)
+          true
+        )
+        
+        (ok u0)
+      )
+      (ok u0)
+    )
+  )
+)
+
+(define-private (find-referral-by-referee (referee principal))
+  (match (map-get? referee-lookup { referee: referee })
+    lookup-data
+    (let
+      (
+        (referrer (get referrer lookup-data))
+      )
+      (map-get? merchant-referrals { referrer: referrer, referee: referee })
+    )
+    none
+  )
+)
+
+(define-private (update-referrer-stats (referrer principal) (new-referrals uint) (new-qualified uint) (new-earned uint) (new-claimed uint))
+  (let
+    (
+      (current-stats (default-to
+        { total-referrals: u0, qualified-referrals: u0, total-rewards-earned: u0, total-rewards-claimed: u0 }
+        (map-get? merchant-referral-stats { merchant: referrer })
+      ))
+    )
+    (map-set merchant-referral-stats
+      { merchant: referrer }
+      {
+        total-referrals: (+ (get total-referrals current-stats) new-referrals),
+        qualified-referrals: (+ (get qualified-referrals current-stats) new-qualified),
+        total-rewards-earned: (+ (get total-rewards-earned current-stats) new-earned),
+        total-rewards-claimed: (+ (get total-rewards-claimed current-stats) new-claimed)
+      }
+    )
   )
 )
