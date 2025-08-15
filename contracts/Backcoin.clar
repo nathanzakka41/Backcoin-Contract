@@ -22,6 +22,9 @@
 (define-constant ERR_MINIMUM_CASHBACK_NOT_MET (err u113))
 (define-constant ERR_REFERRAL_REWARD_ALREADY_CLAIMED (err u114))
 (define-constant ERR_REFERRAL_NOT_QUALIFIED (err u115))
+(define-constant ERR_INVALID_TIER (err u116))
+(define-constant ERR_TIER_REQUIREMENT_NOT_MET (err u117))
+(define-constant ERR_TIER_BONUS_NOT_FOUND (err u118))
 
 (define-fungible-token backcoin)
 
@@ -102,6 +105,38 @@
 (define-map referee-lookup
   { referee: principal }
   { referrer: principal }
+)
+
+;; Customer loyalty tier system
+(define-map customer-tiers
+  { customer: principal }
+  {
+    current-tier: uint, ;; 0=Bronze, 1=Silver, 2=Gold, 3=Platinum
+    tier-since-block: uint,
+    total-tier-purchases: uint,
+    tier-cashback-earned: uint,
+    tier-bonus-earned: uint,
+    last-tier-update: uint
+  }
+)
+
+(define-map tier-requirements
+  { tier-level: uint }
+  {
+    min-purchases: uint,
+    min-cashback: uint,
+    multiplier-bonus: uint, ;; basis points (e.g., 500 = 5% bonus)
+    tier-name: (string-ascii 10)
+  }
+)
+
+(define-map merchant-tier-bonuses
+  { merchant: principal, tier-level: uint }
+  {
+    additional-bonus: uint, ;; extra basis points for this tier
+    is-active: bool,
+    bonus-description: (string-ascii 50)
+  }
 )
 
 (define-data-var next-purchase-id uint u1)
@@ -246,6 +281,7 @@
     
     (update-customer-stats customer amount cashback-amount u0)
     (unwrap-panic (update-referral-progress tx-sender cashback-amount))
+    (unwrap-panic (update-customer-tier customer amount cashback-amount))
     (ok purchase-id)
   )
 )
@@ -532,3 +568,261 @@
     )
   )
 )
+
+;; Initialize default tier requirements
+(define-private (initialize-tier-requirements)
+  (begin
+    ;; Bronze tier (default)
+    (map-set tier-requirements { tier-level: u0 } {
+      min-purchases: u0,
+      min-cashback: u0,
+      multiplier-bonus: u0,
+      tier-name: "Bronze"
+    })
+    ;; Silver tier
+    (map-set tier-requirements { tier-level: u1 } {
+      min-purchases: u500000000, ;; 5 BACK in purchases  
+      min-cashback: u50000000,   ;; 0.5 BACK earned
+      multiplier-bonus: u250,    ;; 2.5% bonus
+      tier-name: "Silver"
+    })
+    ;; Gold tier
+    (map-set tier-requirements { tier-level: u2 } {
+      min-purchases: u2000000000, ;; 20 BACK in purchases
+      min-cashback: u200000000,   ;; 2 BACK earned  
+      multiplier-bonus: u500,     ;; 5% bonus
+      tier-name: "Gold"
+    })
+    ;; Platinum tier
+    (map-set tier-requirements { tier-level: u3 } {
+      min-purchases: u5000000000, ;; 50 BACK in purchases
+      min-cashback: u500000000,   ;; 5 BACK earned
+      multiplier-bonus: u1000,    ;; 10% bonus
+      tier-name: "Platinum"
+    })
+  )
+)
+
+;; Initialize customer tier (called on first purchase)
+(define-private (initialize-customer-tier (customer principal))
+  (if (is-none (map-get? customer-tiers { customer: customer }))
+    (map-set customer-tiers { customer: customer } {
+      current-tier: u0,
+      tier-since-block: stacks-block-height,
+      total-tier-purchases: u0,
+      tier-cashback-earned: u0,
+      tier-bonus-earned: u0,
+      last-tier-update: stacks-block-height
+    })
+    true
+  )
+)
+
+;; Update customer tier based on activity
+(define-private (update-customer-tier (customer principal) (purchase-amount uint) (cashback-amount uint))
+  (let
+    (
+      (tier-info (default-to {
+        current-tier: u0,
+        tier-since-block: stacks-block-height,
+        total-tier-purchases: u0,
+        tier-cashback-earned: u0,
+        tier-bonus-earned: u0,
+        last-tier-update: stacks-block-height
+      } (map-get? customer-tiers { customer: customer })))
+      (new-purchases (+ (get total-tier-purchases tier-info) purchase-amount))
+      (new-cashback (+ (get tier-cashback-earned tier-info) cashback-amount))
+      (current-tier (get current-tier tier-info))
+      (qualified-tier (determine-qualified-tier new-purchases new-cashback))
+    )
+    (initialize-tier-requirements)
+    (initialize-customer-tier customer)
+    
+    (if (> qualified-tier current-tier)
+      ;; Tier promotion
+      (map-set customer-tiers { customer: customer } {
+        current-tier: qualified-tier,
+        tier-since-block: stacks-block-height,
+        total-tier-purchases: new-purchases,
+        tier-cashback-earned: new-cashback,
+        tier-bonus-earned: (get tier-bonus-earned tier-info),
+        last-tier-update: stacks-block-height
+      })
+      ;; Regular update
+      (map-set customer-tiers { customer: customer } {
+        current-tier: current-tier,
+        tier-since-block: (get tier-since-block tier-info),
+        total-tier-purchases: new-purchases,
+        tier-cashback-earned: new-cashback,
+        tier-bonus-earned: (get tier-bonus-earned tier-info),
+        last-tier-update: stacks-block-height
+      })
+    )
+    (ok qualified-tier)
+  )
+)
+
+;; Determine highest qualifying tier
+(define-private (determine-qualified-tier (total-purchases uint) (total-cashback uint))
+  (if (and (>= total-purchases u5000000000) (>= total-cashback u500000000))
+    u3 ;; Platinum
+    (if (and (>= total-purchases u2000000000) (>= total-cashback u200000000))
+      u2 ;; Gold
+      (if (and (>= total-purchases u500000000) (>= total-cashback u50000000))
+        u1 ;; Silver
+        u0 ;; Bronze
+      )
+    )
+  )
+)
+
+;; Calculate tier bonus for customer
+(define-read-only (calculate-tier-bonus (customer principal) (base-cashback uint))
+  (let
+    (
+      (tier-info (map-get? customer-tiers { customer: customer }))
+    )
+    (match tier-info
+      tier-data
+      (let
+        (
+          (tier-level (get current-tier tier-data))
+          (tier-req (map-get? tier-requirements { tier-level: tier-level }))
+        )
+        (match tier-req
+          req-data
+          (let
+            (
+              (multiplier (get multiplier-bonus req-data))
+            )
+            (ok (/ (* base-cashback multiplier) u10000))
+          )
+          (ok u0)
+        )
+      )
+      (ok u0)
+    )
+  )
+)
+
+;; Set merchant-specific tier bonus
+(define-public (set-merchant-tier-bonus (tier-level uint) (additional-bonus uint) (description (string-ascii 50)))
+  (let
+    (
+      (merchant-info (unwrap! (map-get? merchants { merchant-id: tx-sender }) ERR_MERCHANT_NOT_FOUND))
+    )
+    (asserts! (< tier-level u4) ERR_INVALID_TIER)
+    (asserts! (<= additional-bonus u2000) ERR_INVALID_AMOUNT) ;; Max 20% additional bonus
+    (asserts! (get is-active merchant-info) ERR_MERCHANT_INACTIVE)
+    
+    (map-set merchant-tier-bonuses 
+      { merchant: tx-sender, tier-level: tier-level }
+      {
+        additional-bonus: additional-bonus,
+        is-active: true,
+        bonus-description: description
+      }
+    )
+    (ok true)
+  )
+)
+
+;; Claim tier bonus rewards
+(define-public (claim-tier-bonus (merchant principal) (base-cashback uint))
+  (let
+    (
+      (tier-info (unwrap! (map-get? customer-tiers { customer: tx-sender }) ERR_INVALID_TIER))
+      (tier-level (get current-tier tier-info))
+      (tier-bonus-info (map-get? merchant-tier-bonuses { merchant: merchant, tier-level: tier-level }))
+      (base-tier-bonus (unwrap-panic (calculate-tier-bonus tx-sender base-cashback)))
+    )
+    (match tier-bonus-info
+      bonus-data
+      (if (get is-active bonus-data)
+        (let
+          (
+            (additional-bonus (/ (* base-cashback (get additional-bonus bonus-data)) u10000))
+            (total-bonus (+ base-tier-bonus additional-bonus))
+          )
+          (try! (ft-mint? backcoin total-bonus tx-sender))
+          (var-set total-supply (+ (var-get total-supply) total-bonus))
+          
+          ;; Update tier bonus earned
+          (map-set customer-tiers { customer: tx-sender }
+            (merge tier-info { tier-bonus-earned: (+ (get tier-bonus-earned tier-info) total-bonus) })
+          )
+          
+          (ok total-bonus)
+        )
+        (ok base-tier-bonus)
+      )
+      (if (> base-tier-bonus u0)
+        (begin
+          (try! (ft-mint? backcoin base-tier-bonus tx-sender))
+          (var-set total-supply (+ (var-get total-supply) base-tier-bonus))
+          (ok base-tier-bonus)
+        )
+        (ok u0)
+      )
+    )
+  )
+)
+
+;; Get customer tier information
+(define-read-only (get-customer-tier (customer principal))
+  (map-get? customer-tiers { customer: customer })
+)
+
+;; Get tier requirements
+(define-read-only (get-tier-requirements (tier-level uint))
+  (map-get? tier-requirements { tier-level: tier-level })
+)
+
+;; Get all tier requirements
+(define-read-only (get-all-tier-requirements)
+  (ok {
+    bronze: (unwrap-panic (get-tier-requirements u0)),
+    silver: (unwrap-panic (get-tier-requirements u1)),
+    gold: (unwrap-panic (get-tier-requirements u2)),
+    platinum: (unwrap-panic (get-tier-requirements u3))
+  })
+)
+
+;; Get merchant tier bonus
+(define-read-only (get-merchant-tier-bonus (merchant principal) (tier-level uint))
+  (map-get? merchant-tier-bonuses { merchant: merchant, tier-level: tier-level })
+)
+
+;; Check if customer qualifies for tier
+(define-read-only (check-tier-qualification (customer principal) (target-tier uint))
+  (let
+    (
+      (customer-stats-info (map-get? customer-stats { customer: customer }))
+    )
+    (match customer-stats-info
+      stats-data
+      (let
+        (
+          (total-purchases (get total-purchases stats-data))
+          (total-cashback (get total-cashback-earned stats-data))
+          (tier-req (map-get? tier-requirements { tier-level: target-tier }))
+        )
+        (match tier-req
+          req-data
+          (ok (and 
+            (>= total-purchases (get min-purchases req-data))
+            (>= total-cashback (get min-cashback req-data))
+          ))
+          ERR_INVALID_TIER
+        )
+      )
+      (ok false)
+    )
+  )
+)
+
+
+
+
+
+
