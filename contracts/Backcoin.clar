@@ -25,6 +25,12 @@
 (define-constant ERR_INVALID_TIER (err u116))
 (define-constant ERR_TIER_REQUIREMENT_NOT_MET (err u117))
 (define-constant ERR_TIER_BONUS_NOT_FOUND (err u118))
+(define-constant ERR_CAMPAIGN_NOT_FOUND (err u119))
+(define-constant ERR_CAMPAIGN_INACTIVE (err u120))
+(define-constant ERR_CAMPAIGN_EXPIRED (err u121))
+(define-constant ERR_CAMPAIGN_NOT_STARTED (err u122))
+(define-constant ERR_INVALID_CAMPAIGN_DURATION (err u123))
+(define-constant ERR_CAMPAIGN_LIMIT_REACHED (err u124))
 
 (define-fungible-token backcoin)
 
@@ -819,6 +825,226 @@
       (ok false)
     )
   )
+)
+
+;; Promotional Campaigns System
+(define-data-var next-campaign-id uint u1)
+
+;; Campaign data structure
+(define-map promotional-campaigns
+  { campaign-id: uint }
+  {
+    merchant: principal,
+    campaign-name: (string-ascii 50),
+    boosted-cashback-rate: uint, ;; basis points (e.g., 2000 = 20%)
+    start-block: uint,
+    end-block: uint,
+    max-participants: uint,
+    current-participants: uint,
+    total-cashback-issued: uint,
+    is-active: bool,
+    campaign-type: (string-ascii 20), ;; "FLASH_SALE", "SEASONAL", "NEWBIE", "LOYALTY"
+    min-purchase-amount: uint
+  }
+)
+
+;; Track customer participation in campaigns
+(define-map campaign-participation
+  { campaign-id: uint, customer: principal }
+  {
+    purchases-count: uint,
+    total-purchase-amount: uint,
+    total-campaign-cashback: uint,
+    first-purchase-block: uint,
+    last-purchase-block: uint
+  }
+)
+
+;; Create a promotional campaign
+(define-public (create-promotional-campaign
+  (campaign-name (string-ascii 50))
+  (boosted-rate uint)
+  (duration-blocks uint)
+  (max-participants uint)
+  (campaign-type (string-ascii 20))
+  (min-purchase-amount uint)
+)
+  (let (
+    (merchant-info (unwrap! (map-get? merchants { merchant-id: tx-sender }) ERR_MERCHANT_NOT_FOUND))
+    (campaign-id (var-get next-campaign-id))
+  )
+    (asserts! (get is-active merchant-info) ERR_MERCHANT_INACTIVE)
+    (asserts! (<= boosted-rate u5000) ERR_INVALID_CASHBACK_RATE) ;; Max 50% cashback
+    (asserts! (> duration-blocks u0) ERR_INVALID_CAMPAIGN_DURATION)
+    (asserts! (> max-participants u0) ERR_INVALID_AMOUNT)
+    
+    (map-set promotional-campaigns { campaign-id: campaign-id }
+      {
+        merchant: tx-sender,
+        campaign-name: campaign-name,
+        boosted-cashback-rate: boosted-rate,
+        start-block: stacks-block-height,
+        end-block: (+ stacks-block-height duration-blocks),
+        max-participants: max-participants,
+        current-participants: u0,
+        total-cashback-issued: u0,
+        is-active: true,
+        campaign-type: campaign-type,
+        min-purchase-amount: min-purchase-amount
+      }
+    )
+    
+    (var-set next-campaign-id (+ campaign-id u1))
+    (ok campaign-id)
+  )
+)
+
+;; Record purchase with campaign bonus
+(define-public (record-campaign-purchase (customer principal) (amount uint) (campaign-id uint))
+  (let (
+    (merchant-info (unwrap! (map-get? merchants { merchant-id: tx-sender }) ERR_MERCHANT_NOT_FOUND))
+    (campaign-info (unwrap! (map-get? promotional-campaigns { campaign-id: campaign-id }) ERR_CAMPAIGN_NOT_FOUND))
+    (participation-key { campaign-id: campaign-id, customer: customer })
+    (existing-participation (map-get? campaign-participation participation-key))
+    (purchase-id (var-get next-purchase-id))
+  )
+    (asserts! (get is-active merchant-info) ERR_MERCHANT_INACTIVE)
+    (asserts! (get is-active campaign-info) ERR_CAMPAIGN_INACTIVE)
+    (asserts! (is-eq (get merchant campaign-info) tx-sender) ERR_NOT_TOKEN_OWNER)
+    (asserts! (>= stacks-block-height (get start-block campaign-info)) ERR_CAMPAIGN_NOT_STARTED)
+    (asserts! (< stacks-block-height (get end-block campaign-info)) ERR_CAMPAIGN_EXPIRED)
+    (asserts! (>= amount (get min-purchase-amount campaign-info)) ERR_INVALID_AMOUNT)
+    (asserts! (> amount u0) ERR_INVALID_AMOUNT)
+    
+    ;; Check participant limit
+    (if (is-none existing-participation)
+      (asserts! (< (get current-participants campaign-info) (get max-participants campaign-info)) ERR_CAMPAIGN_LIMIT_REACHED)
+      true
+    )
+    
+    ;; Calculate boosted cashback
+    (let (
+      (base-cashback (/ (* amount (get cashback-rate merchant-info)) u10000))
+      (campaign-cashback (/ (* amount (get boosted-cashback-rate campaign-info)) u10000))
+      (total-cashback (+ base-cashback campaign-cashback))
+      (purchase-data {
+        customer: customer,
+        merchant: tx-sender,
+        amount: amount,
+        cashback-amount: total-cashback,
+        purchase-block: stacks-block-height,
+        is-claimed: false
+      })
+    )
+      ;; Record the purchase
+      (map-set purchases { purchase-id: purchase-id } purchase-data)
+      (var-set next-purchase-id (+ purchase-id u1))
+      
+      ;; Update merchant stats
+      (map-set merchants { merchant-id: tx-sender }
+        (merge merchant-info { total-cashback-issued: (+ (get total-cashback-issued merchant-info) total-cashback) })
+      )
+      
+      ;; Update campaign stats
+      (map-set promotional-campaigns { campaign-id: campaign-id }
+        (merge campaign-info {
+          current-participants: (if (is-none existing-participation) 
+                                  (+ (get current-participants campaign-info) u1)
+                                  (get current-participants campaign-info)),
+          total-cashback-issued: (+ (get total-cashback-issued campaign-info) campaign-cashback)
+        })
+      )
+      
+      ;; Update participation record
+      (match existing-participation
+        existing-data
+        (map-set campaign-participation participation-key
+          {
+            purchases-count: (+ (get purchases-count existing-data) u1),
+            total-purchase-amount: (+ (get total-purchase-amount existing-data) amount),
+            total-campaign-cashback: (+ (get total-campaign-cashback existing-data) campaign-cashback),
+            first-purchase-block: (get first-purchase-block existing-data),
+            last-purchase-block: stacks-block-height
+          }
+        )
+        (map-set campaign-participation participation-key
+          {
+            purchases-count: u1,
+            total-purchase-amount: amount,
+            total-campaign-cashback: campaign-cashback,
+            first-purchase-block: stacks-block-height,
+            last-purchase-block: stacks-block-height
+          }
+        )
+      )
+      
+      ;; Update customer stats
+      (update-customer-stats customer amount total-cashback u0)
+      (unwrap-panic (update-referral-progress tx-sender total-cashback))
+      (unwrap-panic (update-customer-tier customer amount total-cashback))
+      
+      (ok purchase-id)
+    )
+  )
+)
+
+;; Deactivate a campaign
+(define-public (deactivate-campaign (campaign-id uint))
+  (let (
+    (campaign-info (unwrap! (map-get? promotional-campaigns { campaign-id: campaign-id }) ERR_CAMPAIGN_NOT_FOUND))
+  )
+    (asserts! (is-eq tx-sender (get merchant campaign-info)) ERR_NOT_TOKEN_OWNER)
+    (asserts! (get is-active campaign-info) ERR_CAMPAIGN_INACTIVE)
+    
+    (map-set promotional-campaigns { campaign-id: campaign-id }
+      (merge campaign-info { is-active: false })
+    )
+    (ok true)
+  )
+)
+
+;; Read-only functions for campaigns
+(define-read-only (get-campaign-info (campaign-id uint))
+  (ok (map-get? promotional-campaigns { campaign-id: campaign-id }))
+)
+
+(define-read-only (get-campaign-participation (campaign-id uint) (customer principal))
+  (ok (map-get? campaign-participation { campaign-id: campaign-id, customer: customer }))
+)
+
+(define-read-only (is-campaign-active (campaign-id uint))
+  (match (map-get? promotional-campaigns { campaign-id: campaign-id })
+    campaign-info (ok (and 
+      (get is-active campaign-info)
+      (>= stacks-block-height (get start-block campaign-info))
+      (< stacks-block-height (get end-block campaign-info))
+    ))
+    (ok false)
+  )
+)
+
+(define-read-only (calculate-campaign-cashback (campaign-id uint) (amount uint))
+  (match (map-get? promotional-campaigns { campaign-id: campaign-id })
+    campaign-info (let (
+      (merchant-info (unwrap-panic (map-get? merchants { merchant-id: (get merchant campaign-info) })))
+      (base-cashback (/ (* amount (get cashback-rate merchant-info)) u10000))
+      (campaign-bonus (/ (* amount (get boosted-cashback-rate campaign-info)) u10000))
+    )
+      (ok {
+        base-cashback: base-cashback,
+        campaign-bonus: campaign-bonus,
+        total-cashback: (+ base-cashback campaign-bonus)
+      })
+    )
+    ERR_CAMPAIGN_NOT_FOUND
+  )
+)
+
+(define-read-only (get-merchant-campaigns (merchant principal))
+  (ok {
+    next-campaign-id: (var-get next-campaign-id),
+    merchant: merchant
+  })
 )
 
 
